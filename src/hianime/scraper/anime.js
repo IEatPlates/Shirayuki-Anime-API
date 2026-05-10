@@ -49,29 +49,35 @@ export const getHiAnimeAnimeDetails = async (animeId) => {
   const details = {};
   const genres = [];
 
-  detail.find('.anisc-info .item, .anisc-info li, .anisc-info .item-title').each((_, el) => {
-    const $el = $(el);
-    const text = $el.text().replace(/\s+/g, ' ').trim();
-    if (text.includes(':')) {
-      const parts = text.split(':');
-      const key = parts[0].trim();
-      const value = parts.slice(1).join(':').trim();
+  // .anisc-info is a sibling of .anisc-detail, not inside it
+  const info = $('.anisc-info').first();
 
-      if (key === 'Genres') {
-        $el.find('a[href*="/genre/"]').each((__, a) => {
-          const g = $(a).text().trim();
-          if (g) genres.push(g);
-        });
-        if (genres.length === 0 && value) {
-          value.split(',').forEach((g) => {
-            const cleaned = g.trim();
-            if (cleaned) genres.push(cleaned);
-          });
-        }
-      } else {
-        const normalizedKey = key.toLowerCase().replace(/\s+/g, '');
-        details[normalizedKey] = value;
-      }
+  // Handle genres - look for .item-list with Genres heading
+  info.find('.item-list').each((_, el) => {
+    const $el = $(el);
+    const head = $el.find('.item-head').text().trim();
+    if (head === 'Genres:') {
+      $el.find('a[href*="/genre/"]').each((__, a) => {
+        const g = $(a).text().trim();
+        if (g) genres.push(g);
+      });
+    }
+  });
+
+  // Handle other details - look for .item-title elements
+  info.find('.item-title').each((_, el) => {
+    const $el = $(el);
+    const key = $el.find('.item-head').text().trim().replace(':', '');
+    const value = $el.find('.name').text().trim();
+
+    if (key === 'Genres') {
+      $el.find('a[href*="/genre/"]').each((__, a) => {
+        const g = $(a).text().trim();
+        if (g) genres.push(g);
+      });
+    } else if (key && value) {
+      const normalizedKey = key.toLowerCase().replace(/\s+/g, '');
+      details[normalizedKey] = value;
     }
   });
 
@@ -123,7 +129,7 @@ export const getHiAnimeAnimeDetails = async (animeId) => {
     details: {
       country: details.country || null,
       premiered: details.premiered || null,
-      aired: details.dateaired || null,
+      aired: details.aired || null,
       broadcast: details.broadcast || null,
       totalEpisodes: details.episodes || null,
       duration: details.duration || null,

@@ -14,9 +14,16 @@ export const getHiAnimeEpisodes = async (animeId) => {
 
   const { url, $ } = await fetchHiAnimePage(`/watch/${animeId}`);
 
-  const title = $('.watch-section .main-entity .title').first().text().trim() || null;
-  const subTotal = parseNumber($('.watch-section .main-entity .info .sub').first().text().trim() || '') || 0;
-  const dubTotal = parseNumber($('.watch-section .main-entity .info .dub').first().text().trim() || '') || 0;
+  // Title can be found in multiple places
+  const title =
+    $('.watch-section .main-entity .title').first().text().trim() ||
+    $('h1.dynamic-name').first().text().trim() ||
+    $('.film-name').first().text().trim() ||
+    null;
+
+  // Episode counts are in .tick-sub and .tick-dub
+  const subTotal = parseNumber($('.tick-sub').first().text().trim() || '') || 0;
+  const dubTotal = parseNumber($('.tick-dub').first().text().trim() || '') || 0;
   const totalEpisodes = Math.max(subTotal, dubTotal);
 
   const episodes = Array.from({ length: totalEpisodes }, (_, index) => {
