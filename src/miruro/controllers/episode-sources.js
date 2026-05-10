@@ -1,0 +1,34 @@
+import { getMiruroEpisodeSources } from '../scraper/episode-sources.js';
+
+export const miruroEpisodeSourcesController = async (c) => {
+  try {
+    const animeEpisodeId = c.req.query('animeEpisodeId');
+    const ep = c.req.query('ep');
+    const server = c.req.query('server');
+    const category = c.req.query('category');
+
+    if (!animeEpisodeId) {
+      return c.json(
+        {
+          success: false,
+          error: 'animeEpisodeId query parameter is required',
+        },
+        400
+      );
+    }
+
+    const data = await getMiruroEpisodeSources({ animeEpisodeId, ep, server, category });
+    return c.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: error.message,
+      },
+      500
+    );
+  }
+};
