@@ -1,4 +1,6 @@
 import { axios } from '../../utils/scrapper-deps.js';
+import cloudscraper from 'cloudscraper';
+import cache from '../../utils/cache.js';
 import * as zlib from 'zlib';
 import { USER_AGENT } from '../../utils/constants.js';
 
@@ -7,6 +9,108 @@ const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const HEADLESS_TIMEOUT_MS = 20000;
 const PIPE_OBF_KEY = '71951034f8fbcf53d89db52ceb3dc22c';
 const PIPE_PROTOCOL_VERSION = '0.2.0';
+const HEADLESS_BLOCKED_RESOURCES = new Set(['image', 'stylesheet', 'font']);
+
+let headlessBrowserInstance = null;
+
+const getHeadlessBrowser = async () => {
+  if (headlessBrowserInstance) return headlessBrowserInstance;
+
+  const puppeteerModule = await import('puppeteer');
+  const puppeteer = puppeteerModule.default || puppeteerModule;
+  headlessBrowserInstance = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-background-networking',
+      '--disable-extensions',
+      '--disable-features=TranslateUI',
+      '--disable-sync',
+      '--no-first-run',
+      '--no-zygote',
+      '--window-size=1280,720',
+    ],
+  });
+
+  return headlessBrowserInstance;
+};
+
+process.on('exit', () => {
+  if (headlessBrowserInstance) {
+    headlessBrowserInstance.close().catch(() => {});
+  }
+});
+
+const fetchHtmlWithCloudscraper = async (url, referer) => {
+  try {
+    const result = await cloudscraper({
+      url,
+      headers: {
+        'User-Agent': DEFAULT_UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        Referer: referer || MIRURO_BASE_URL,
+      },
+      timeout: 12000,
+      challengeTimeout: 12000,
+    });
+
+    if (typeof result === 'string') return result;
+    if (result && typeof result === 'object' && typeof result.body === 'string') return result.body;
+  } catch {
+    return null;
+  }
+
+  return null;
+};
+
+const fetchHtml = async (url, referer) => {
+  const viaCloudscraper = await fetchHtmlWithCloudscraper(url, referer);
+  if (viaCloudscraper) return viaCloudscraper;
+
+  const { data } = await axios.get(url, {
+    headers: {
+      'User-Agent': DEFAULT_UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Referer: referer || MIRURO_BASE_URL,
+    },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+
+  return data;
+};
+
+const fetchJsonWithCloudscraper = async (url, referer) => {
+  try {
+    const result = await cloudscraper({
+      url,
+      headers: {
+        'User-Agent': DEFAULT_UA,
+        Accept: 'application/json,text/plain,*/*',
+        'X-Requested-With': 'XMLHttpRequest',
+        Referer: referer || MIRURO_BASE_URL,
+      },
+      timeout: 12000,
+      challengeTimeout: 12000,
+    });
+
+    if (result && typeof result === 'object') return result;
+    if (typeof result === 'string') {
+      try {
+        return JSON.parse(result);
+      } catch {
+        return { raw: result };
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+};
 
 const parseEpisodeNumber = (animeEpisodeId, epQuery) => {
   if (epQuery && Number(epQuery) > 0) {
@@ -238,7 +342,26 @@ const resolveM3u8Metadata = async (m3u8Url, referer) => {
   }
 };
 
-const collectCandidateUrls = ($, scriptsText) => {
+const resolveUrl = (baseUrl, value) => {
+  if (!value || !baseUrl) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('http')) return trimmed;
+  if (trimmed.startsWith('//')) {
+    const base = new URL(baseUrl);
+    return `${base.protocol}${trimmed}`;
+  }
+  if (trimmed.startsWith('/') || trimmed.startsWith('./') || trimmed.startsWith('../')) {
+    try {
+      return new URL(trimmed, baseUrl).toString();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const collectCandidateUrls = ($, scriptsText, baseUrl = null) => {
   const urls = new Set();
   const attrNames = ['data-embed', 'data-src', 'data-url', 'data-source', 'data-player', 'data-iframe', 'data-file'];
 
@@ -246,18 +369,31 @@ const collectCandidateUrls = ($, scriptsText) => {
     `[${attr}]`;
     $(`[${attr}]`).each((_, el) => {
       const value = $(el).attr(attr);
-      if (value && value.startsWith('http')) urls.add(value.trim());
+      if (!value) return;
+      const resolved = resolveUrl(baseUrl, value) || (value.startsWith('http') ? value.trim() : null);
+      if (resolved) urls.add(resolved);
     });
   });
 
   $('iframe, video, source').each((_, el) => {
     const value = $(el).attr('src');
-    if (value && value.startsWith('http')) urls.add(value.trim());
+    if (!value) return;
+    const resolved = resolveUrl(baseUrl, value) || (value.startsWith('http') ? value.trim() : null);
+    if (resolved) urls.add(resolved);
   });
 
   if (scriptsText) {
     const matches = scriptsText.match(/https?:\/\/[^"'\s<>]+/g) || [];
     matches.forEach((url) => urls.add(url.trim()));
+
+    const callRegex = /(fetch|axios\.(get|post)|\$\.(get|post))\(\s*['"]([^'"]+)['"]/gi;
+    let match = callRegex.exec(scriptsText);
+    while (match) {
+      const value = match[4];
+      const resolved = resolveUrl(baseUrl, value);
+      if (resolved) urls.add(resolved);
+      match = callRegex.exec(scriptsText);
+    }
   }
 
   return [...urls];
@@ -304,11 +440,72 @@ const extractSkipData = (mediaData) => {
   return { intro, outro };
 };
 
+const extractM3u8FromText = (text) => {
+  if (!text || typeof text !== 'string') return null;
+  const match = text.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/i);
+  return match ? match[0] : null;
+};
+
+const extractM3u8FromPayload = (payload) => {
+  if (!payload) return null;
+  if (typeof payload === 'string') return extractM3u8FromText(payload);
+
+  const pick = (value) => (typeof value === 'string' && value.includes('.m3u8') ? value : null);
+  const direct = pick(payload?.source) || pick(payload?.file) || pick(payload?.url) || pick(payload?.src);
+  if (direct) return direct;
+
+  const nested = payload?.data || payload?.result || payload?.stream || payload?.media;
+  const nestedDirect = pick(nested?.source) || pick(nested?.file) || pick(nested?.url) || pick(nested?.src);
+  if (nestedDirect) return nestedDirect;
+
+  const sources = payload?.sources || payload?.data?.sources || payload?.result?.sources || payload?.stream?.sources;
+  if (Array.isArray(sources)) {
+    for (const entry of sources) {
+      const url = pick(entry?.file) || pick(entry?.src) || pick(entry?.url) || pick(entry?.source);
+      if (url) return url;
+    }
+  }
+
+  return extractM3u8FromText(JSON.stringify(payload));
+};
+
+const tryFetchEmbedApiSources = async ({ candidates, referer }) => {
+  if (!Array.isArray(candidates) || !candidates.length) return null;
+
+  const filtered = candidates.filter((url) => /api|ajax|source|stream|playlist|player|media/i.test(url));
+  const targets = filtered.length ? filtered : candidates;
+
+  for (const url of targets.slice(0, 6)) {
+    try {
+      const cloudData = await fetchJsonWithCloudscraper(url, referer);
+      const payload = cloudData?.raw ? cloudData.raw : cloudData;
+      const m3u8 = extractM3u8FromPayload(payload);
+      if (m3u8) return { m3u8Url: m3u8, mediaData: payload };
+
+      const resp = await axios.get(url, {
+        headers: {
+          'User-Agent': DEFAULT_UA,
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: referer || MIRURO_BASE_URL,
+          Accept: 'application/json,text/plain,*/*',
+        },
+        timeout: 8000,
+        validateStatus: () => true,
+      });
+
+      const m3u8Direct = extractM3u8FromPayload(resp?.data);
+      if (m3u8Direct) return { m3u8Url: m3u8Direct, mediaData: resp?.data };
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+};
+
 const extractM3u8WithPuppeteer = async (targetUrl, referer, serverName, category) => {
   if (process.env.MIRURO_USE_HEADLESS === 'false') return null;
 
-  const puppeteerModule = await import('puppeteer');
-  const puppeteer = puppeteerModule.default || puppeteerModule;
   let browser;
   let page;
   let m3u8Url = null;
@@ -316,16 +513,16 @@ const extractM3u8WithPuppeteer = async (targetUrl, referer, serverName, category
   const responsePromises = [];
 
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
+    browser = await getHeadlessBrowser();
 
     page = await browser.newPage();
+    await page.setCacheEnabled(true);
     await page.setUserAgent(DEFAULT_UA);
     if (referer) {
       await page.setExtraHTTPHeaders({ Referer: referer });
     }
+
+    await page.setRequestInterception(true);
 
     const captureUrl = (url) => {
       if (url && url.includes('.m3u8')) {
@@ -333,7 +530,15 @@ const extractM3u8WithPuppeteer = async (targetUrl, referer, serverName, category
       }
     };
 
-    page.on('request', (req) => captureUrl(req.url()));
+    page.on('request', (req) => {
+      captureUrl(req.url());
+      const type = req.resourceType();
+      if (HEADLESS_BLOCKED_RESOURCES.has(type)) {
+        req.abort().catch(() => {});
+        return;
+      }
+      req.continue().catch(() => {});
+    });
     page.on('response', (res) => {
       captureUrl(res.url());
       const headers = res.headers();
@@ -352,7 +557,7 @@ const extractM3u8WithPuppeteer = async (targetUrl, referer, serverName, category
       );
     });
 
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: HEADLESS_TIMEOUT_MS });
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: HEADLESS_TIMEOUT_MS });
 
     const initialM3u8 = m3u8Url;
 
@@ -500,17 +705,13 @@ const extractM3u8WithPuppeteer = async (targetUrl, referer, serverName, category
         await page.close();
       } catch {}
     }
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
   }
 
   return { m3u8Url, mediaData };
 };
 
 export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, category }) => {
+  const startedAt = Date.now();
   const animeId = normalizeAnimeId(animeEpisodeId);
 
   if (!animeId) {
@@ -520,20 +721,25 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
   const episodeNumber = parseEpisodeNumber(animeEpisodeId, ep);
   const normalizedServer = normalizeServer(server);
   const normalizedCategory = normalizeCategory(category);
+  const cacheKey = `miruro:sources:${animeId}:${episodeNumber}:${normalizedServer}:${normalizedCategory}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
 
   const watchUrl = `${MIRURO_BASE_URL}/watch/${animeId}?ep=${episodeNumber}`;
+
+  const withCache = (payload) => {
+    const finalized = {
+      ...payload,
+      extractionTimeMs: Date.now() - startedAt,
+    };
+    cache.set(cacheKey, finalized);
+    return finalized;
+  };
 
   // Try to fetch the watch page to get video source
   try {
     const { load } = await import('cheerio');
-    const { data: html } = await axios.get(watchUrl, {
-      headers: {
-        'User-Agent': DEFAULT_UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        Referer: MIRURO_BASE_URL,
-      },
-      timeout: 15000,
-    });
+    const html = await fetchHtml(watchUrl, MIRURO_BASE_URL);
 
     const $ = load(html);
 
@@ -575,7 +781,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
 
     // Check for embed URLs that might lead to m3u8
     const embedMatch = scripts.match(/["']embed["']\s*:\s*["'](https?:\/\/[^"'\s]+)["']/);
-    const candidates = collectCandidateUrls($, scripts);
+    const candidates = collectCandidateUrls($, scripts, watchUrl);
     const embedUrl = embedMatch?.[1] || iframeSrc || pickBestEmbedUrl(candidates, normalizedServer) || null;
 
     const source = m3u8Url || (videoSrc && videoSrc.includes('.m3u8') ? videoSrc : null);
@@ -583,7 +789,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
     if (source) {
       const meta = await resolveM3u8Metadata(source, MIRURO_BASE_URL);
       const skipData = await applySkipData(meta.intro, meta.outro, animeId, episodeNumber);
-      return {
+      return withCache({
         animeId,
         episode: episodeNumber,
         sourcePage: watchUrl,
@@ -601,26 +807,18 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
         intro: skipData.intro ?? meta.intro,
         outro: skipData.outro ?? meta.outro,
         note: 'Direct m3u8 stream found',
-      };
+      });
     }
 
     if (embedUrl) {
       const embedSource = await (async () => {
         try {
-          const { data: embedHtml } = await axios.get(embedUrl, {
-            headers: {
-              'User-Agent': DEFAULT_UA,
-              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              Referer: MIRURO_BASE_URL,
-            },
-            timeout: 15000,
-            validateStatus: () => true,
-          });
+          const embedHtml = await fetchHtml(embedUrl, MIRURO_BASE_URL);
 
           const { load: loadEmbed } = await import('cheerio');
           const $embed = loadEmbed(embedHtml);
           const embedScripts = $embed('script:not([src])').map((_, el) => $embed(el).text()).get().join(' ');
-          const embedCandidates = collectCandidateUrls($embed, embedScripts);
+          const embedCandidates = collectCandidateUrls($embed, embedScripts, embedUrl);
           return pickBestEmbedUrl(embedCandidates, normalizedServer);
         } catch {
           return null;
@@ -630,7 +828,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
       if (embedSource && embedSource.includes('.m3u8')) {
         const meta = await resolveM3u8Metadata(embedSource, embedUrl);
         const skipData = await applySkipData(meta.intro, meta.outro, animeId, episodeNumber);
-        return {
+        return withCache({
           animeId,
           episode: episodeNumber,
           sourcePage: watchUrl,
@@ -648,7 +846,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
           intro: skipData.intro ?? meta.intro,
           outro: skipData.outro ?? meta.outro,
           note: 'm3u8 extracted from embed URL',
-        };
+        });
       }
     }
   } catch (error) {
@@ -670,15 +868,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
 
     const embedUrl = serverUrls[normalizedServer] || serverUrls['telli'];
 
-    const { data: embedHtml } = await axios.get(embedUrl, {
-      headers: {
-        'User-Agent': DEFAULT_UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        Referer: MIRURO_BASE_URL,
-      },
-      timeout: 15000,
-      validateStatus: () => true,
-    });
+    const embedHtml = await fetchHtml(embedUrl, MIRURO_BASE_URL);
 
     const { load } = await import('cheerio');
     const $embed = load(embedHtml);
@@ -688,6 +878,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
 
     // Search scripts in embed page
     const embedScripts = $embed('script:not([src])').map((_, el) => $embed(el).text()).get().join(' ');
+    const embedCandidates = collectCandidateUrls($embed, embedScripts, embedUrl);
 
     // Look for m3u8 in embed scripts - include ultracloud.cc pattern
     const embedM3u8Patterns = [
@@ -718,7 +909,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
       const meta = isM3u8 ? await resolveM3u8Metadata(embedSource, embedUrl) : { tracks: [], intro: null, outro: null };
       const skipData = await applySkipData(meta.intro, meta.outro, animeId, episodeNumber);
 
-      return {
+      return withCache({
         animeId,
         episode: episodeNumber,
         sourcePage: watchUrl,
@@ -736,7 +927,35 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
         intro: skipData.intro ?? meta.intro,
         outro: skipData.outro ?? meta.outro,
         note: isM3u8 ? 'm3u8 extracted from embed page' : 'Video source from embed page',
-      };
+      });
+    }
+
+    const apiResult = await tryFetchEmbedApiSources({ candidates: embedCandidates, referer: embedUrl });
+    if (apiResult?.m3u8Url) {
+      const meta = await resolveM3u8Metadata(apiResult.m3u8Url, embedUrl);
+      const extractedTracks = extractTracksFromMediaData(apiResult.mediaData);
+      const skipData = extractSkipData(apiResult.mediaData);
+      const tracks = extractedTracks.length ? extractedTracks : meta.tracks;
+      const fallbackSkip = await applySkipData(skipData.intro, skipData.outro, animeId, episodeNumber);
+      return withCache({
+        animeId,
+        episode: episodeNumber,
+        sourcePage: watchUrl,
+        sources: [
+          {
+            source: apiResult.m3u8Url,
+            type: 'm3u8',
+            quality: null,
+            referer: embedUrl,
+            server: normalizedServer,
+            category: normalizedCategory,
+          },
+        ],
+        tracks,
+        intro: fallbackSkip.intro ?? meta.intro,
+        outro: fallbackSkip.outro ?? meta.outro,
+        note: 'm3u8 extracted from embed API',
+      });
     }
   } catch (embedError) {
     console.log('[getMiruroEpisodeSources] Embed fetch error:', embedError.message);
@@ -773,7 +992,7 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
       const skipData = extractSkipData(mediaData);
       const tracks = extractedTracks.length ? extractedTracks : meta.tracks;
       const fallbackSkip = await applySkipData(skipData.intro, skipData.outro, animeId, episodeNumber);
-      return {
+      return withCache({
         animeId,
         episode: episodeNumber,
         sourcePage: watchUrl,
@@ -791,14 +1010,14 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
         intro: fallbackSkip.intro ?? meta.intro,
         outro: fallbackSkip.outro ?? meta.outro,
         note: 'm3u8 captured from headless browser requests',
-      };
+      });
     }
   } catch (headlessError) {
     console.log('[getMiruroEpisodeSources] Headless fetch error:', headlessError.message);
   }
 
   // Final fallback: return the watch URL as iframe source
-  return {
+  return withCache({
     animeId,
     episode: episodeNumber,
     sourcePage: watchUrl,
@@ -816,5 +1035,5 @@ export const getMiruroEpisodeSources = async ({ animeEpisodeId, ep, server, cate
     intro: null,
     outro: null,
     note: 'Miruro.tv uses client-side video loading. Try using puppeteer or browser automation to extract actual m3u8 sources.',
-  };
+  });
 };
