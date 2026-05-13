@@ -1,8 +1,8 @@
 import { load, axios } from '../../utils/scrapper-deps.js';
 import { USER_AGENT } from '../../utils/constants.js';
 
-const ANIMEKAI_HOME_URL = 'https://anikai.to/home';
-const ANIMEKAI_BASE_URL = 'https://anikai.to';
+const ANIMEKAI_HOME_URL = 'https://anikai.cc/home';
+const ANIMEKAI_BASE_URL = 'https://anikai.cc';
 
 const parseNumber = (value) => {
   const match = value?.match(/\d+/);

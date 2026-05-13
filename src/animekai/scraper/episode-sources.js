@@ -2,7 +2,7 @@ import { fetchAnimekaiPage } from './_shared.js';
 import { axios } from '../../utils/scrapper-deps.js';
 import cloudscraper from 'cloudscraper';
 
-const ANIMEKAI_BASE_URL = 'https://anikai.to';
+const ANIMEKAI_BASE_URL = 'https://anikai.cc';
 
 // Detect serverless environment (Vercel, AWS Lambda, etc.)
 const isServerless = Boolean(

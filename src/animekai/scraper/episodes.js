@@ -5,7 +5,7 @@ const parseNumber = (value) => {
   return match ? Number(match[0]) : null;
 };
 
-const toWatchUrl = (animeId, episodeNumber) => `https://anikai.to/watch/${animeId}#ep=${episodeNumber}`;
+const toWatchUrl = (animeId, episodeNumber) => `https://anikai.cc/watch/${animeId}#ep=${episodeNumber}`;
 
 export const getAnimekaiEpisodes = async (animeId) => {
   if (!animeId || typeof animeId !== 'string' || animeId.trim() === '') {
